@@ -1,0 +1,457 @@
+
+
+
+
+
+makesig = function(drugr,gexpression,gtissues,fdr=.1,sd=1,percent=0,normalization="none",main.effect.only = TRUE, cores=8){
+  ##########################################################################################################################
+  # input: drugr: as list of IC50 values with cell-lines as names
+  #        gexpression: dataframe of gene-expression for training set
+  #                    cell-line names in columns(names)
+  #                    probesets in rows (row.names)
+  #       
+  #        gtissues: dataframe tissue types of each cell-line
+  #                    column 1: line
+  #                    column 2: tissue of origin
+  #        fdr: false discovery threshold for 2-way ANOVA
+  #        sd: standard deviation for selection of resistant and sensitive cell-lines
+  #        percent: percent value for selection of resistant and sensentive cell-lines(ie top and bottom 10%) 
+  #        (defaults to sd=1; any non-zero value for percent will overide)
+  #        normalization= "znorm"  or "rank" or "none"  sample-wise normalization
+  #
+  # output:list of 
+  #        signature: vector of probesets in the signature
+  #        toplines: vector of cell-lines with sensitive reponse
+  #        bottomlines: vector of cell-lines with non-sensitive response
+  #  
+  # algorithm:
+  #        if percent =0
+  #           sensitive cell-lines => 1SD above IC50 mean
+  #           insensitive cell-lines <= 1SD below IC50 mean
+  #        if percent > 0
+  #           sensitive cell-lines => top percent of training set
+  #           resistant cell-lines => botom percent of training set
+  #
+  #
+  #        2-way anova of gene-expresion vs. sensitive/insensitive and Tissue type
+  #        if main.effect.only = TRUE
+  #             Keep probesets that have a main IC50 response fdr <= fdr_threshold
+  #             but don't have tissues-specific effects
+  #        if main.effect.only = FALSE
+  #             Keep probesets that have a main IC50 response fdr <= fdr_threshold
+  #
+  #
+  ##########################################################################################################################
+  
+  library(parallel)
+  
+  drugr.s = sort(unlist(drugr))
+  drugr.s = drugr.s[!is.na(drugr.s)]
+  
+  if (percent > 0){
+    
+    percentcount  = round(length(drugr.s) * percent )
+    drugr.s.bottom = drugr.s[1:percentcount] 
+    drugr.s.top = drugr.s[(length(drugr.s) - percentcount + 1):length(drugr.s)]
+  
+  } else {
+    
+    drugr.s.sd = (drugr.s-mean(drugr.s))/(sd(drugr.s))
+    drugr.s.bottom = drugr.s[drugr.s.sd <= -sd]
+    drugr.s.top = drugr.s[drugr.s.sd >=sd]
+  }
+  
+  top.genes = gexpression[,names(gexpression) %in% names(drugr.s.top)]
+  bottom.genes = gexpression[,names(gexpression) %in% names(drugr.s.bottom)]
+  all.genes = cbind(bottom.genes,top.genes)
+  if(normalization=="rank"){all.genes = as.data.frame(apply(all.genes,2,rank))}
+  if(normalization=="znorm"){all.genes = as.data.frame(scale(all.genes))}
+  drug.response = c( rep(0,ncol(bottom.genes)),rep(1,ncol(top.genes)) )
+  tissues = gtissues[match(names(all.genes),gtissues[,"line"]),"tissue"]
+  
+  jj = as.data.frame(cbind(drug.response,tissues))
+  jj$drug.response = as.factor(jj$drug.response)
+  jj$tissues = as.factor(jj$tissues)
+  
+  
+  aa = function(x){
+    fit = aov(as.vector(x) ~ drug.response  + tissues + drug.response*tissues, jj)
+    return(c(anova(fit)[5][[1]][1],anova(fit)[5][[1]][2],anova(fit)[5][[1]][3]))
+  }
+  
+  
+  if (cores == 1) { res = t(apply(all.genes,1,aa))}  
+  
+  #run on multiple cpu cores or nodes
+  if (cores > 1){
+    cl <- makeCluster(getOption("cl.cores", cores))
+    res = t(parApply(cl,all.genes,1,aa))
+    stopCluster(cl)
+  }
+ 
+  
+  res[,1] = p.adjust(res[,1],method="BH")
+  res[,2] = p.adjust(res[,2],method="BH")
+  res[,3] = p.adjust(res[,3],method = "BH")
+  
+  res1 = res[res[,1] <= fdr,]
+  res2 =  res[res[,2] <= fdr,]
+  res3 = res[res[,3] <= fdr,]
+  
+  signature.main = setdiff(row.names(res1),as.vector(c(row.names(res2),row.names(res3))))
+  signature.all = row.names(res1)
+  toplines = names(drugr.s.top)
+  bottomlines = names(drugr.s.bottom)
+  
+  if (main.effect.only == TRUE)  {signature = signature.main} else
+  if (main.effect.only == FALSE) {signature = signature.all} 
+  
+  return(list(signature=signature,toplines=toplines,bottomlines=bottomlines))
+  
+}
+
+
+
+makeprediction = function(sig,trainset,testset,batchcorrect="znorm",class_prob=.6,returnraw=FALSE,ntrees=5000){
+####################################################################################################################
+# input: sig: a list of:
+#             (signature) vector of probesets in the signature
+#             (toplines)  vector of drug sensitive cell-lines
+#             (bottomlines) vector drug insensitive cell-lines
+#
+#       trainset: dataframe of gene-expression for training set
+#                    cell-line names in columns(names)
+#                    probesets in rows (row.names)
+#       
+#       testset:  dataframe of gene-expression for training set
+#                    cell-line names in columns(names)
+#                    probesets in rows (row.names)
+#  
+#       batchcorrect: none:no correction between training and test sets
+#                     array: all probesets between training and test set
+#                     array.sig(recommended): all probesets between training set signature
+#                                and testset
+# 
+#                     sig: signature probesets between training set signature
+#                         and testset
+#  
+#                     znorm:
+#                     mean.center
+#
+#
+#       class_prob: Value 0..1 required to call sensitive or restistant 
+#                   if neither is >= class_prob return 1 for intermediate results
+#
+#       returnraw: if true, return the raw sensitive probability 0..1 instead of class
+#        
+#
+# output: list of 0 and 2 indicating resistant or sensitive
+#         1 indicates intermediate
+#  
+#         if returnraw == TRUE, return raw probability of being sensitive
+#         
+# algorithm: binary classification using Random Forest
+#
+#
+#
+################################################################################################################# 
+
+  library(randomForest)
+  library(sva)
+  
+  common.features = intersect(row.names(trainset),row.names(testset))
+  trainset = trainset[row.names(trainset) %in% common.features,]
+  testset = testset[row.names(testset) %in% common.features,]
+  trainset = trainset[sort(row.names(trainset)),]
+  testset = testset[sort(row.names(testset)),]
+  
+  if (batchcorrect == "array"){
+    batch1 = as.factor(c(rep(1,ncol(trainset)),rep(2,ncol(testset))))
+    trainset.testset = cbind(trainset,testset)
+    trainset.testset = ComBat(dat = trainset.testset, batch=batch1, mod = NULL)
+    trainset = as.data.frame(trainset.testset[,batch1 == "1"])
+    testset = as.data.frame(trainset.testset[,batch1 == "2"])
+   }
+  
+  
+  if (batchcorrect == "array.sig"){
+    
+    trainset = trainset[,names(trainset) %in% c(sig$bottomlines,sig$toplines)]
+    batch1 = as.factor(c(rep(1,ncol(trainset)),rep(2,ncol(testset))))
+    trainset.testset = cbind(trainset,testset)
+    trainset.testset = ComBat(dat = trainset.testset, batch=batch1, mod = NULL)
+    trainset = as.data.frame(trainset.testset[,batch1 == "1"])
+    testset = as.data.frame(trainset.testset[,batch1 == "2"])
+  }
+  
+  if (batchcorrect == "znorm"){
+  
+     trainset = trainset[,names(trainset) %in% c(sig$bottomlines,sig$toplines)]
+     batch1 = as.factor(c(rep(1,ncol(trainset)),rep(2,ncol(testset))))
+     trainset.testset = cbind(trainset,testset)
+     trainset.testset = scale(trainset.testset)
+     trainset = as.data.frame(trainset.testset[,batch1 == "1"])
+     testset = as.data.frame(trainset.testset[,batch1 == "2"])
+  }
+
+   if (batchcorrect == "rank"){
+  
+      trainset = trainset[,names(trainset) %in% c(sig$bottomlines,sig$toplines)]
+      batch1 = as.factor(c(rep(1,ncol(trainset)),rep(2,ncol(testset))))
+      trainset.testset = cbind(trainset,testset)
+      trainset.testset = as.data.frame(apply(trainset.testset,2,rank))
+      trainset = as.data.frame(trainset.testset[,batch1 == "1"])
+      testset = as.data.frame(trainset.testset[,batch1 == "2"])
+   }
+
+
+
+
+  if (batchcorrect == "mean.center"){
+  
+     trainset = trainset[,names(trainset) %in% c(sig$bottomlines,sig$toplines)]
+     batch1 = as.factor(c(rep(1,ncol(trainset)),rep(2,ncol(testset))))
+     trainset.testset = cbind(trainset,testset)
+     trainset.testset = scale(trainset.testset,scale=FALSE)
+     trainset = as.data.frame(trainset.testset[,batch1 == "1"])
+     testset = as.data.frame(trainset.testset[,batch1 == "2"])
+  }
+
+
+  
+
+  bottomgenes = trainset[row.names(trainset) %in% sig$signature,sig$bottomlines]
+  topgenes = trainset[row.names(trainset) %in% sig$signature,sig$toplines]
+  drugresponse = c(rep(0,length(sig$bottomlines)),rep(1,length(sig$toplines)))
+  
+  train = cbind(bottomgenes,topgenes)
+  test = testset[row.names(testset) %in% row.names(train),]
+ 
+  if (batchcorrect == "sig"){
+    batch1 = as.factor(c(rep(1,ncol(train)),rep(2,ncol(test))))
+    train.test = cbind(train,test)
+    train.test = ComBat(dat = train.test, batch=batch1, mod = NULL)
+    train = as.data.frame(train.test[,batch1 == "1"])
+    test = as.data.frame(train.test[,batch1 == "2"])
+
+  }  
+  
+  
+
+  rf = randomForest(t(train),as.factor(drugresponse),ntree=ntrees)
+  pred = predict(rf,t(test),type="prob")
+  
+  if(returnraw == TRUE) return(pred[,2])
+
+  classes = rep(1,nrow(pred))
+  resistant = (pred[,1] >= class_prob)
+  sensitive = (pred[,2] >= class_prob)
+  classes[resistant == TRUE] = 0
+  classes[sensitive == TRUE] = 2
+  classes = as.list(classes)
+  names(classes) = row.names(pred)
+  classes
+}
+
+
+
+
+
+
+
+coxen = function(slist, trainset, testset, percentile=.98){
+  #################################################################################
+  # Input: 
+  #        slist: list of probeset features for each particular signature
+  #        trainset: training set of gene expression values 
+  #        testset: test set of gene expression values
+  #        percentile:keep genes with coxen scores >= this percentile 
+  #          
+  # Output: list of probeset features that fall above the percentile cutoff
+  #
+  # Algorithm: Coexpression Extrapolation to find genes that
+  #            show similar covariance to other genes in their respective dataset              
+  #
+  #
+  #################################################################################
+  
+  rn1 = row.names(trainset)[row.names(trainset) %in% slist]
+  rn2 = row.names(testset)[row.names(testset) %in% slist]
+  rn.common = intersect(rn1,rn2)
+  
+  geneframe1 = t(trainset[row.names(trainset) %in% rn.common,])
+  geneframe2 = t(testset[row.names(testset) %in% rn.common,])
+  
+  
+  gfcor1 = cor(geneframe1)
+  gfcor2 = cor(geneframe2)
+  rm1 = as.vector(rowMeans(gfcor1))
+  rm2 = as.vector(rowMeans(gfcor2))
+  cor1kernal = gfcor1 - rm1
+  cor2kernal = gfcor2 - rm2
+  bosskernal1 = colSums(cor1kernal * cor2kernal)
+  bosskernal2 = colSums(cor1kernal^2)
+  bosskernal3 = colSums(cor2kernal^2)
+  uberkernal = bosskernal1/ (sqrt(bosskernal2) * sqrt(bosskernal3))
+  ccvals = as.vector(uberkernal)
+  
+  
+  #calculate p-value by generating an empirical null distribution
+  gfuber = c()
+  for(i in 1:100){
+    gf1r = geneframe1[ sample(1:dim(geneframe1)[1]),sample(1:dim(geneframe1)[2])]
+    gf2r = geneframe2[ sample(1:dim(geneframe2)[1]),sample(1:dim(geneframe2)[2])]
+    
+    gfcor1 = cor(gf1r)
+    gfcor2 = cor(gf2r)
+    rm1 = as.vector(rowMeans(gfcor1))
+    rm2 = as.vector(rowMeans(gfcor2))
+    cor1kernal = gfcor1 - rm1
+    cor2kernal = gfcor2 - rm2
+    bosskernal1 = colSums(cor1kernal * cor2kernal)
+    bosskernal2 = colSums(cor1kernal^2)
+    bosskernal3 = colSums(cor2kernal^2)
+    uberkernal = bosskernal1/ (sqrt(bosskernal2) * sqrt(bosskernal3))
+    coxy = as.vector(uberkernal)
+    
+    
+    gfuber = c(gfuber,coxy)
+  }
+  
+  p02 = quantile(gfuber,probs=c(percentile))
+  slist[ccvals >= p02]
+  
+}
+
+
+
+
+
+
+
+one.step = function(predictors,response,test,trees=500){
+###################################################
+# input:
+#          predictors:matrix of gene expression values for each cell-line
+#          response:vector of -log(ic50) value for drug response
+#          test: vector of gene expression values for the cell-line to predict
+#          trees: number of regression tree models in the ensemble
+# output:
+#          predicted drug response for the test vector
+#
+# algorithm:
+#          fit randomforest regression model
+###################################################
+
+  library(randomForest)
+
+  predictors = t(predictors)
+  rf  = randomForest(x=predictors,y=response,na.action=na.omit,ntree=trees)
+  predict(rf,test)
+
+}
+
+
+
+two.step = function(predictors,response,test,trees=500){
+########################################################
+# input:
+#          predictors:matrix of gene expression values for each cell-line
+#          response:vector of -log(ic50) value for drug response
+#          test: vector of gene expression values for the cell-line to predict
+#          trees: number of regression tree models in the ensemble
+# output:
+#          predicted drug response for the test vector
+#
+# algorithm:
+#          1: fit randomforest regression model
+#          2: subset gene expression levels by importance >= 1 sd
+#          3: fit a new randomforest model on the subset
+#########################################################
+  library(randomForest)
+  
+  predictors = t(predictors)
+  rf  = randomForest(x=predictors,y=response,importance=TRUE,na.action=na.omit,ntree=trees)
+ 
+  imp = as.vector(unlist(importance(rf,type=1,scale=TRUE)))
+  predictors2 = predictors[,imp>=1]
+  test2 = test[imp>=1]
+  rf2  = randomForest(x=predictors2,y=response,proximity=TRUE,na.action=na.omit,ntree=500)
+  predict(rf2,test2)
+
+}
+
+
+
+three.step = function(predictors,response,test,trees=500,pvalue= 0.1,correction="none"){
+########################################################
+# input:
+#          predictors:matrix of gene expression values for each cell-line
+#          response:vector of -log(ic50) value for drug response
+#          test: vector of gene expression values for the cell-line to predict
+#          trees: number of regression tree models in the ensemble
+#          p-value: cutoff p-value for the proximity test        
+#          correction: correction for multiple hypothesis testing
+#
+#
+# output:
+#          predicted drug response for the test vector
+#
+# algorithm:
+#          1: fit randomforest regression model
+#          2: subset gene expression levels by importance >= 1 sd
+#          3: fit a new randomforest model on the subset
+#          4: subset the cases(cell-lines) by model proximity 
+#          5: fit a new randomforest model on the subset
+#
+#########################################################
+
+
+ library(randomForest)
+
+ #step one
+  predictors = t(predictors)
+  rf  = randomForest(x=predictors,y=response,importance=TRUE,na.action=na.omit,ntree=trees)
+ 
+ #step two
+  imp = as.vector(unlist(importance(rf,type=1,scale=TRUE)))
+  predictors2 = predictors[,imp>=1]
+  test2 = test[imp>=1]
+  rf2  = randomForest(x=predictors2,y=response,proximity=TRUE,na.action=na.omit,ntree=trees)
+  
+
+  
+ #step three
+ cor.res = c()
+ for(i in 1:length(response)){
+    r1 = as.vector(unlist(rf2$proximity[,i]))
+    r2 = abs(response[i] - response)
+    cor.res = c(cor.res,cor.test(r1,r2)$p.value)
+ }
+
+p.adjust(cor.res, method = correction)
+response3 = response[cor.res <=pvalue]
+predictors3 = predictors2[cor.res <= pvalue,]
+rf3  = randomForest(x=predictors3,y=response3,na.action=na.omit,ntree=trees)
+predict(rf3,test2)
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
