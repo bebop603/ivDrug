@@ -442,6 +442,21 @@ predict(rf3,test2)
 
 
 
+#example usage
+
+DTP.Drugs = read.table("DTP.Drugs.txt")
+NCI60.Genelogic.Chiron = read.table("NCI60.Genelogic.Chiron.txt")
+predictors = NCI60.Genelogic.Chiron[,1:59]
+response = as.vector(unlist(DTP.Drugs[1,1:59]))
+test = as.vector(unlist(NCI60.Genelogic.Chiron[,60]))
+
+
+one.step(predictors,response,test)
+two.step(predictors,response,test)
+three.step(predictors,response,test)
+
+
+
 
 
 
