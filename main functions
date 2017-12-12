@@ -365,7 +365,7 @@ two.step = function(predictors,response,test,trees=500){
 #
 # algorithm:
 #          1: fit randomforest regression model
-#          2: subset gene expression levels by importance >= 1 sd
+#          2: subset gene expression levels by importance >= 1=2 sd
 #          3: fit a new randomforest model on the subset
 #########################################################
   library(randomForest)
@@ -374,8 +374,8 @@ two.step = function(predictors,response,test,trees=500){
   rf  = randomForest(x=predictors,y=response,importance=TRUE,na.action=na.omit,ntree=trees)
  
   imp = as.vector(unlist(importance(rf,type=1,scale=TRUE)))
-  predictors2 = predictors[,imp>=1]
-  test2 = test[imp>=1]
+  predictors2 = predictors[,imp>=2]
+  test2 = test[imp>=2]
   rf2  = randomForest(x=predictors2,y=response,proximity=TRUE,na.action=na.omit,ntree=500)
   predict(rf2,test2)
 
@@ -399,7 +399,7 @@ three.step = function(predictors,response,test,trees=500,pvalue= 0.1,correction=
 #
 # algorithm:
 #          1: fit randomforest regression model
-#          2: subset gene expression levels by importance >= 1 sd
+#          2: subset gene expression levels by importance >= 2 sd
 #          3: fit a new randomforest model on the subset
 #          4: subset the cases(cell-lines) by model proximity 
 #          5: fit a new randomforest model on the subset
@@ -415,8 +415,8 @@ three.step = function(predictors,response,test,trees=500,pvalue= 0.1,correction=
  
  #step two
   imp = as.vector(unlist(importance(rf,type=1,scale=TRUE)))
-  predictors2 = predictors[,imp>=1]
-  test2 = test[imp>=1]
+  predictors2 = predictors[,imp>=2]
+  test2 = test[imp>=2]
   rf2  = randomForest(x=predictors2,y=response,proximity=TRUE,na.action=na.omit,ntree=trees)
   
 
